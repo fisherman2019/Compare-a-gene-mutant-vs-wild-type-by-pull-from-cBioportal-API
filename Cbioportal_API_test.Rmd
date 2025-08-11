@@ -1,0 +1,218 @@
+---
+title: "cBioPortal_test"
+author: "Xingjun Liu"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Description
+
+This is an R Markdown for test pulling gene expression data through [cBioPortal API](https://waldronlab.io/cBioPortalData/reference/cBioPortal.html).
+
+The script include:
+
+1. finds a TCGA glioma study,
+
+2. locates the mutation profile and the mRNA expression profile,
+
+3. pulls mutation data to identify IDH1-R132H mutant samples,
+
+4. pulls expression (z-scores if available) for the samples,
+
+5. computes mean expression difference (mutant − wild-type),
+
+6. returns & plots the top 10 overexpressed genes.
+
+This uses the exact **cBioPortalData** functions documented in the reference *(cBioPortal(), getStudies(), molecularProfiles(), geneTable(), mutationData(), getSampleInfo(), getDataByGenes() / fetchData() as appropriate)*
+
+## Install and load required libraries
+```{r library, echo=TRUE,eval=TRUE}
+
+# Install & load necessary packages
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+BiocManager::install("cBioPortalData")
+
+library(cBioPortalData)
+library(tidyr)
+library(ggplot2)
+library(dplyr)
+
+```
+## 1. Build API connection and pull all studies 
+```{r connection, echo = TRUE, eval=TRUE}
+# Initialize connection to the API
+cbio <- cBioPortal()
+
+# List all studies, then filter for glioma/TCGA
+studies <- getStudies(cbio, buildReport = FALSE)
+
+```
+## 2. Pull glioma studies include: glioma, lgg, gbm from Cbioportal stuies
+```{r glioma_stuies, echo=TRUE,eval=TRUE}
+glioma_candidates <- studies %>%
+  filter(grepl("glioma", name, ignore.case = TRUE) |
+           grepl("lgg", studyId, ignore.case = TRUE) |
+           grepl("gbm", studyId, ignore.case = TRUE) |
+           grepl("glioma", studyId, ignore.case = TRUE))
+
+print(head(glioma_candidates[, c("studyId", "name")], 20))
+
+# choose study (change if you prefer "gbm_tcga" or combine later)
+study_id <- "lgg_tcga"   # <- change if you want another
+
+```
+## 3. Find mutation & expression molecular profile IDs for the study
+
+```{r expr_profile, echo=TRUE,eval=TRUE}
+# mutation & expression molecular profile
+profiles <- molecularProfiles(cbio, studyId = study_id)
+# prefer mutation profile (MAF / MUTATION_EXTENDED)
+mut_profiles <- profiles %>% filter(grepl("MUTATION", molecularAlterationType, ignore.case = TRUE) |
+                                      grepl("mutations", molecularProfileId, ignore.case = TRUE) |
+                                      grepl("maf", datatype, ignore.case = TRUE))
+if (nrow(mut_profiles) == 0) stop("No mutation profile found for study: ", study_id)
+mutation_profile_id <- mut_profiles$molecularProfileId[1]
+message("Using mutation profile: ", mutation_profile_id)
+
+# prefer mRNA z-score profile (for comparison)
+expr_profiles <- profiles %>% filter(grepl("MRNA_EXPRESSION", molecularAlterationType, ignore.case = TRUE))
+# try to pick a Z-SCORE profile if present (cBioPortal's Comparison tab uses z-scores)
+expr_profile_id <- expr_profiles %>%
+  filter(grepl("Z-SCORE", datatype, ignore.case = TRUE)) %>%
+  pull(molecularProfileId) %>% .[1]
+if (is.na(expr_profile_id) || length(expr_profile_id) == 0) {
+  expr_profile_id <- expr_profiles$molecularProfileId[1]
+}
+message("Using expression profile: ", expr_profile_id)
+
+```
+## 4. Get Entrez ID for IDH1,gene panel and sample information
+```{r genes, echo=TRUE,eval=TRUE}
+# ---get Entrez ID for IDH1 ----
+gene_table <- geneTable(cbio, pageSize = 20000)   # pull gene table
+idh1_entrez <- gene_table$entrezGeneId[match("IDH1", gene_table$hugoGeneSymbol)]
+if (is.na(idh1_entrez)) stop("IDH1 not found in gene table on this cBioPortal instance")
+
+# Collect sample information
+sample_info <- getSampleInfo(cbio, studyId = study_id)
+
+# Extract just the sample IDs
+sample_ids <- sample_info$sampleId
+
+```
+## 5. Get all mutation data for IDH1 and extract sample information
+```{r mutation-data, echo=TRUE,eval=TRUE}
+# ----query mutation data for IDH1 and extract samples with R132H ----
+mut_df <- mutationData(cbio,
+                       molecularProfileIds = mutation_profile_id,
+                       entrezGeneIds = idh1_entrez,
+                       sampleIds = sample_ids)
+
+# look for 'R132H' in protein-change column (handle variants like 'p.R132H')
+mutant_samples <- mut_df[["lgg_tcga_mutations"]][["sampleId"]]
+message("Found ", length(mutant_samples), " samples with IDH1 R132H")
+
+if (length(mutant_samples) == 0) {
+  stop("No IDH1 R132H mutants found. You may want to broaden the mutation filter or inspect mut_df manually.")
+}
+
+```
+
+## 6. Get all samples for study and define wild-type group, fetch expression data for genes
+
+```{r echo=TRUE,eval=TRUE}
+# ---- get all samples for study and define wild-type group ----
+# sample_info <- getSampleInfo(cbio, studyId = study_id)
+all_samples <- sample_info$sampleId
+wt_samples <- setdiff(all_samples, mutant_samples)
+message("Total study samples: ", length(all_samples), "; wild-type candidates: ", length(wt_samples))
+
+# ----  fetch expression data for genes (we'll fetch all genes then compute ranking) ----
+# NOTE: getDataByGenes allows using Hugo symbols (faster than entrez in many cases)
+all_genes <- gene_table$hugoGeneSymbol
+
+# Query expression (may take a bit of time for all genes)
+expr_raw <- getDataByGenes(cbio,
+                           studyId = study_id,
+                           genes = all_genes,
+                           by = "hugoGeneSymbol",
+                           molecularProfileIds = expr_profile_id,
+                           sampleIds = c(mutant_samples, wt_samples))
+
+# expr_raw should be a data.frame/tibble with columns for gene, sampleId, and value (z-score or expression)
+
+if (is.list(expr_raw) && length(expr_raw) > 0 && is.data.frame(expr_raw[[1]])) {
+  expr_df <- expr_raw[[1]]
+} else if (is.data.frame(expr_raw)) {
+  expr_df <- expr_raw
+} else {
+  stop("Unexpected structure returned by getDataByGenes(); inspect the object 'expr_raw'.")
+}
+
+# locate columns and rename
+gene_col_expr <- names(expr_df)[grepl("hugoGene", names(expr_df), ignore.case = TRUE)][1]
+sample_col_expr <- names(expr_df)[grepl("sampleId", names(expr_df), ignore.case = TRUE)][1]
+value_col_expr <- names(expr_df)[grepl("value|zscore|z_score|z-score|score", names(expr_df), ignore.case = TRUE)][1]
+
+if (any(is.na(c(gene_col_expr, sample_col_expr, value_col_expr)))) {
+  stop("Can't find gene/sample/value columns in expression result; names(expr_df): ", paste(names(expr_df), collapse = ", "))
+}
+
+# convert to matrix: genes x samples
+expr_df2 <- expr_df %>%
+  select(gene = all_of(gene_col_expr),
+         sampleId = all_of(sample_col_expr),
+         value = all_of(value_col_expr)) %>%
+  filter(!is.na(value))
+
+# use tapply to reshape to matrix (handles duplicates by taking the first)
+expr_mat <- tapply(expr_df2$value, list(expr_df2$gene, expr_df2$sampleId), function(x) x[1])
+expr_mat <- as.matrix(expr_mat)
+
+# keep only samples that appear in expression matrix
+mut_samples_in_expr <- intersect(mutant_samples, colnames(expr_mat))
+wt_samples_in_expr <- intersect(wt_samples, colnames(expr_mat))
+message("Mutant samples in expression matrix: ", length(mut_samples_in_expr),
+        "; WT samples in expression matrix: ", length(wt_samples_in_expr))
+
+if (length(mut_samples_in_expr) < 2 || length(wt_samples_in_expr) < 2) {
+  warning("Small group sizes in expression matrix; results may be unstable.")
+}
+
+```
+
+## 7. Compute group means and select top 10 differential expressed genes
+```{r top10_df, echo=TRUE,eval=TRUE}
+
+# ---- compute group means and rank genes (for z-score expression we use difference-of-means) ----
+mean_mut <- rowMeans(expr_mat[, mut_samples_in_expr, drop = FALSE], na.rm = TRUE)
+mean_wt  <- rowMeans(expr_mat[, wt_samples_in_expr, drop = FALSE], na.rm = TRUE)
+diff_mean <- mean_mut - mean_wt   # for z-scores, difference-of-means is interpretable
+
+top_genes <- sort(diff_mean, decreasing = TRUE)
+top10 <- head(top_genes, 10)
+top10_df <- data.frame(gene = names(top10), diff_mean = as.numeric(top10), row.names = NULL)
+
+print(top10_df)
+
+```
+
+## 8. Plot to show the top 10 differential expressed genes
+
+```{r plot, echo=TRUE,eval=TRUE}
+# ----  plot top 10 ----
+ggplot(top10_df, aes(x = reorder(gene, diff_mean), y = diff_mean)) +
+  geom_col() +
+  coord_flip() +
+  labs(title = paste0("Top 10 genes (IDH1-R132H mutant vs mean Wild type)\nStudy: ", study_id),
+       x = "Gene", y = "Mean z-score difference (IDH1-R132H - WT)") +
+  theme_minimal()
+
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
